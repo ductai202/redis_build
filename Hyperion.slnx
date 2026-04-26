@@ -6,4 +6,7 @@
     <Project Path="src/Hyperion.Protocol/Hyperion.Protocol.csproj" />
     <Project Path="src/Hyperion.Server/Hyperion.Server.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Hyperion.Protocol.Tests/Hyperion.Protocol.Tests.csproj" />
+  </Folder>
 </Solution>
