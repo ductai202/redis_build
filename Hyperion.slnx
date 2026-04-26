@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Hyperion.Config/Hyperion.Config.csproj" />
+    <Project Path="src/Hyperion.Core/Hyperion.Core.csproj" />
+    <Project Path="src/Hyperion.DataStructures/Hyperion.DataStructures.csproj" />
+    <Project Path="src/Hyperion.Protocol/Hyperion.Protocol.csproj" />
+    <Project Path="src/Hyperion.Server/Hyperion.Server.csproj" />
+  </Folder>
+</Solution>
