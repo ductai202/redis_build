@@ -480,3 +480,8 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Benchmark tooling & raw output
+redis-win/
+redis-win.zip
+bench_*.txt
