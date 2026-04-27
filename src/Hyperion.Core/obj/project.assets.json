@@ -12,6 +12,19 @@
           "bin/placeholder/Hyperion.Config.dll": {}
         }
       },
+      "Hyperion.DataStructures/1.0.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v10.0",
+        "dependencies": {
+          "Hyperion.Config": "1.0.0"
+        },
+        "compile": {
+          "bin/placeholder/Hyperion.DataStructures.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Hyperion.DataStructures.dll": {}
+        }
+      },
       "Hyperion.Protocol/1.0.0": {
         "type": "project",
         "framework": ".NETCoreApp,Version=v10.0",
@@ -33,6 +46,11 @@
       "path": "../Hyperion.Config/Hyperion.Config.csproj",
       "msbuildProject": "../Hyperion.Config/Hyperion.Config.csproj"
     },
+    "Hyperion.DataStructures/1.0.0": {
+      "type": "project",
+      "path": "../Hyperion.DataStructures/Hyperion.DataStructures.csproj",
+      "msbuildProject": "../Hyperion.DataStructures/Hyperion.DataStructures.csproj"
+    },
     "Hyperion.Protocol/1.0.0": {
       "type": "project",
       "path": "../Hyperion.Protocol/Hyperion.Protocol.csproj",
@@ -42,6 +60,7 @@
   "projectFileDependencyGroups": {
     "net10.0": [
       "Hyperion.Config >= 1.0.0",
+      "Hyperion.DataStructures >= 1.0.0",
       "Hyperion.Protocol >= 1.0.0"
     ]
   },
@@ -80,6 +99,9 @@
           "projectReferences": {
             "D:\\TAI\\Code\\redis-c#\\redis_build\\src\\Hyperion.Config\\Hyperion.Config.csproj": {
               "projectPath": "D:\\TAI\\Code\\redis-c#\\redis_build\\src\\Hyperion.Config\\Hyperion.Config.csproj"
+            },
+            "D:\\TAI\\Code\\redis-c#\\redis_build\\src\\Hyperion.DataStructures\\Hyperion.DataStructures.csproj": {
+              "projectPath": "D:\\TAI\\Code\\redis-c#\\redis_build\\src\\Hyperion.DataStructures\\Hyperion.DataStructures.csproj"
             },
             "D:\\TAI\\Code\\redis-c#\\redis_build\\src\\Hyperion.Protocol\\Hyperion.Protocol.csproj": {
               "projectPath": "D:\\TAI\\Code\\redis-c#\\redis_build\\src\\Hyperion.Protocol\\Hyperion.Protocol.csproj"

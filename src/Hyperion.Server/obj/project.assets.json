@@ -259,6 +259,7 @@
         "framework": ".NETCoreApp,Version=v10.0",
         "dependencies": {
           "Hyperion.Config": "1.0.0",
+          "Hyperion.DataStructures": "1.0.0",
           "Hyperion.Protocol": "1.0.0"
         },
         "compile": {
@@ -266,6 +267,19 @@
         },
         "runtime": {
           "bin/placeholder/Hyperion.Core.dll": {}
+        }
+      },
+      "Hyperion.DataStructures/1.0.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v10.0",
+        "dependencies": {
+          "Hyperion.Config": "1.0.0"
+        },
+        "compile": {
+          "bin/placeholder/Hyperion.DataStructures.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Hyperion.DataStructures.dll": {}
         }
       },
       "Hyperion.Protocol/1.0.0": {
@@ -717,6 +731,11 @@
       "type": "project",
       "path": "../Hyperion.Core/Hyperion.Core.csproj",
       "msbuildProject": "../Hyperion.Core/Hyperion.Core.csproj"
+    },
+    "Hyperion.DataStructures/1.0.0": {
+      "type": "project",
+      "path": "../Hyperion.DataStructures/Hyperion.DataStructures.csproj",
+      "msbuildProject": "../Hyperion.DataStructures/Hyperion.DataStructures.csproj"
     },
     "Hyperion.Protocol/1.0.0": {
       "type": "project",
