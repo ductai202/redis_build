@@ -8,4 +8,5 @@ public class Storage
     public System.Collections.Concurrent.ConcurrentDictionary<string, SimpleSet> SetStore { get; } = new();
     public System.Collections.Concurrent.ConcurrentDictionary<string, ZSet> ZSetStore { get; } = new();
     public System.Collections.Concurrent.ConcurrentDictionary<string, Bloom> BloomStore { get; } = new();
+    public System.Collections.Concurrent.ConcurrentDictionary<string, CMS> CmsStore { get; } = new();
 }

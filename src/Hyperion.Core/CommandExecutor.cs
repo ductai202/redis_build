@@ -10,6 +10,7 @@ public class CommandExecutor : ICommandExecutor
     private readonly SetCommands _setCommands;
     private readonly ZSetCommands _zsetCommands;
     private readonly BloomCommands _bloomCommands;
+    private readonly CmsCommands _cmsCommands;
 
     public CommandExecutor()
     {
@@ -18,6 +19,7 @@ public class CommandExecutor : ICommandExecutor
         _setCommands = new SetCommands(_storage);
         _zsetCommands = new ZSetCommands(_storage);
         _bloomCommands = new BloomCommands(_storage);
+        _cmsCommands = new CmsCommands(_storage);
     }
 
     public CommandExecutor(Storage storage)
@@ -27,6 +29,7 @@ public class CommandExecutor : ICommandExecutor
         _setCommands = new SetCommands(_storage);
         _zsetCommands = new ZSetCommands(_storage);
         _bloomCommands = new BloomCommands(_storage);
+        _cmsCommands = new CmsCommands(_storage);
     }
 
     public byte[] Execute(RespCommand command)
@@ -51,9 +54,14 @@ public class CommandExecutor : ICommandExecutor
             "BF.RESERVE" => _bloomCommands.BfReserve(command.Args),
             "BF.MADD" => _bloomCommands.BfMadd(command.Args),
             "BF.EXISTS" => _bloomCommands.BfExists(command.Args),
+            "CMS.INITBYDIM" => _cmsCommands.CmsInitByDim(command.Args),
+            "CMS.INITBYPROB" => _cmsCommands.CmsInitByProb(command.Args),
+            "CMS.INCRBY" => _cmsCommands.CmsIncrBy(command.Args),
+            "CMS.QUERY" => _cmsCommands.CmsQuery(command.Args),
             _ => RespEncoder.Encode(new Exception($"ERR unknown command '{command.Cmd}'"))
         };
     }
+
 
 
 
