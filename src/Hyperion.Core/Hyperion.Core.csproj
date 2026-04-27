@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Hyperion.Protocol\Hyperion.Protocol.csproj" />
     <ProjectReference Include="..\Hyperion.Config\Hyperion.Config.csproj" />
+    <ProjectReference Include="..\Hyperion.DataStructures\Hyperion.DataStructures.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

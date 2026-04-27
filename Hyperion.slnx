@@ -7,6 +7,8 @@
     <Project Path="src/Hyperion.Server/Hyperion.Server.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Hyperion.Core.Tests/Hyperion.Core.Tests.csproj" />
+    <Project Path="tests/Hyperion.DataStructures.Tests/Hyperion.DataStructures.Tests.csproj" />
     <Project Path="tests/Hyperion.Protocol.Tests/Hyperion.Protocol.Tests.csproj" />
     <Project Path="tests/Hyperion.Server.Tests/Hyperion.Server.Tests.csproj" />
   </Folder>
