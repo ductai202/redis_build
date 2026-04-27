@@ -20,7 +20,6 @@ public class EvictionCandidate
 /// <summary>
 /// Maintains a pool of keys sampled for eviction, sorted by last access time (oldest first).
 /// This is an approximate LRU implementation similar to Redis.
-/// Go source: eviction_pool.go
 /// </summary>
 public class EvictionPool
 {
