@@ -4,7 +4,6 @@ namespace Hyperion.DataStructures;
 
 /// <summary>
 /// Represents a candidate for eviction in the LRU pool.
-/// Go source: eviction_pool.go
 /// </summary>
 public class EvictionCandidate
 {

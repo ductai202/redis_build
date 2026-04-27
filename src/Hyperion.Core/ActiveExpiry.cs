@@ -3,9 +3,7 @@ using Hyperion.Config;
 namespace Hyperion.Core;
 
 /// <summary>
-/// Proactively deletes expired keys from the database in the background.
-/// Uses a random sampling approach similar to Redis.
-/// Go source: expire.go
+/// Background task that periodically samples keys and deletes expired ones.
 /// </summary>
 public class ActiveExpiry
 {

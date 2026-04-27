@@ -5,7 +5,6 @@ namespace Hyperion.DataStructures;
 /// <summary>
 /// A Sorted Set implementation using a combination of a Dictionary and a Skiplist.
 /// The dictionary provides O(1) access to scores, while the skiplist provides O(log(N)) ranking and ranges.
-/// Ported from sortedset_skiplist.go.
 /// </summary>
 public class ZSet
 {

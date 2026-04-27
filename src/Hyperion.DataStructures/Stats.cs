@@ -1,8 +1,7 @@
 namespace Hyperion.DataStructures;
 
 /// <summary>
-/// Keeps track of the database statistics like total keys, expired keys, etc.
-/// Go source: stats.go
+/// Tracks global statistics for the Redis server.
 /// </summary>
 public static class Stats
 {

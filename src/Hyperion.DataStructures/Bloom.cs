@@ -6,7 +6,6 @@ namespace Hyperion.DataStructures;
 
 /// <summary>
 /// A probabilistic data structure used to test whether an element is a member of a set.
-/// Ported from bloom.go
 /// </summary>
 public class Bloom
 {

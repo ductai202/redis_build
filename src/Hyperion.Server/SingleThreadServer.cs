@@ -10,15 +10,8 @@ using Microsoft.Extensions.Logging;
 namespace Hyperion.Server;
 
 /// <summary>
-/// Single-threaded TCP server using async/await and System.IO.Pipelines.
-/// 
-/// Architecture:
-/// - One TcpListener accepts connections
-/// - Each connection gets its own Task (via Task.Run) for reading
-/// - Commands are parsed with RespParser and executed directly via CommandExecutor
-/// - No workers, no channels — simple direct execution (like Go's RunIoMultiplexingServer)
-/// 
-/// Go source: server.go:RunIoMultiplexingServer + single_listener_server.go:StartSingleListener
+/// A single-threaded RESP server implementation using Socket.Select (IO Multiplexing).
+/// This implementation handles all client IO and command execution in a single thread to avoid locking overhead.
 /// </summary>
 public sealed class SingleThreadServer
 {

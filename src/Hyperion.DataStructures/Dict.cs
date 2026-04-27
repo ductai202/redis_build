@@ -21,9 +21,7 @@ public class DictObject
 }
 
 /// <summary>
-/// Main dictionary storage for Hyperion.
-/// Manages key-value pairs and their expiration.
-/// Go source: dict.go
+/// Core dictionary structure for storing key-value pairs with TTL and eviction support.
 /// </summary>
 public class Dict
 {
