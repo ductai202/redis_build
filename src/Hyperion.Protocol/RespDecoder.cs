@@ -141,4 +141,12 @@ public static class RespDecoder
         result = list;
         return true;
     }
+
+    public static void Decode(byte[] input, out object? result, out int bytesConsumed)
+    {
+        var seq = new ReadOnlySequence<byte>(input);
+        var reader = new SequenceReader<byte>(seq);
+        TryDecodeOne(ref reader, out result);
+        bytesConsumed = (int)reader.Consumed;
+    }
 }

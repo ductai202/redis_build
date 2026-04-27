@@ -27,7 +27,9 @@ Hyperion speaks standard RESP2, so you can connect with any `redis-cli` or Redis
 | Category | Commands |
 |---|---|
 | Connection | `PING` |
-| String | `SET`, `GET`, `DEL`, `TTL` |
+| String | `SET`, `GET`, `DEL`, `TTL`, `INCR`, `DECR` |
+| Hash | `HSET`, `HGET`, `HDEL`, `HGETALL` |
+| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE` |
 | Set | `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS` |
 | Sorted Set | `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZRANGE` |
 | Bloom Filter | `BF.RESERVE`, `BF.MADD`, `BF.EXISTS` |
@@ -180,6 +182,5 @@ Full details in [doc/Benchmark.md](doc/Benchmark.md).
 
 ## What's next
 
-- [ ] More commands (HSET/HGET, LPUSH/LPOP, INCR/DECR, etc.)
 - [ ] Redis Cluster protocol
 - [ ] RDB persistence

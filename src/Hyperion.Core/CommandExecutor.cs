@@ -12,6 +12,9 @@ public class CommandExecutor : ICommandExecutor
     private readonly BloomCommands _bloomCommands;
     private readonly CmsCommands _cmsCommands;
 
+    private readonly HashCommands _hashCommands;
+    private readonly ListCommands _listCommands;
+
     public CommandExecutor()
     {
         _storage = new Storage();
@@ -20,6 +23,8 @@ public class CommandExecutor : ICommandExecutor
         _zsetCommands = new ZSetCommands(_storage);
         _bloomCommands = new BloomCommands(_storage);
         _cmsCommands = new CmsCommands(_storage);
+        _hashCommands = new HashCommands(_storage);
+        _listCommands = new ListCommands(_storage);
     }
 
     public CommandExecutor(Storage storage)
@@ -30,6 +35,8 @@ public class CommandExecutor : ICommandExecutor
         _zsetCommands = new ZSetCommands(_storage);
         _bloomCommands = new BloomCommands(_storage);
         _cmsCommands = new CmsCommands(_storage);
+        _hashCommands = new HashCommands(_storage);
+        _listCommands = new ListCommands(_storage);
     }
 
     public byte[] Execute(RespCommand command)
@@ -42,6 +49,8 @@ public class CommandExecutor : ICommandExecutor
             "TTL"  => _stringCommands.Ttl(command.Args),
             "DEL"  => _stringCommands.Del(command.Args),
             "INFO" => _stringCommands.Info(command.Args),
+            "INCR" => _stringCommands.Incr(command.Args),
+            "DECR" => _stringCommands.Decr(command.Args),
             "SADD" => _setCommands.Sadd(command.Args),
             "SMEMBERS" => _setCommands.Smembers(command.Args),
             "SISMEMBER" => _setCommands.Sismember(command.Args),
@@ -51,6 +60,15 @@ public class CommandExecutor : ICommandExecutor
             "ZSCORE" => _zsetCommands.Zscore(command.Args),
             "ZRANK" => _zsetCommands.Zrank(command.Args),
             "ZRANGE" => _zsetCommands.Zrange(command.Args),
+            "HSET" => _hashCommands.HSet(command.Args),
+            "HGET" => _hashCommands.HGet(command.Args),
+            "HDEL" => _hashCommands.HDel(command.Args),
+            "HGETALL" => _hashCommands.HGetAll(command.Args),
+            "LPUSH" => _listCommands.LPush(command.Args),
+            "RPUSH" => _listCommands.RPush(command.Args),
+            "LPOP" => _listCommands.LPop(command.Args),
+            "RPOP" => _listCommands.RPop(command.Args),
+            "LRANGE" => _listCommands.LRange(command.Args),
             "BF.RESERVE" => _bloomCommands.BfReserve(command.Args),
             "BF.MADD" => _bloomCommands.BfMadd(command.Args),
             "BF.EXISTS" => _bloomCommands.BfExists(command.Args),

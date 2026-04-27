@@ -78,4 +78,41 @@ public class StringCommands
         sb.Append($"db0:keys={Stats.HashKeySpaceStat.Key},expires=0,avg_ttl=0\r\n");
         return RespEncoder.Encode(sb.ToString(), isSimpleString: false);
     }
+
+    public byte[] Incr(string[] args) => IncrBy(args, 1);
+    public byte[] Decr(string[] args) => IncrBy(args, -1);
+
+    private byte[] IncrBy(string[] args, long delta)
+    {
+        if (args.Length != 1) return RespEncoder.Encode(new Exception($"ERR wrong number of arguments for command"));
+        string key = args[0];
+        
+        var obj = _storage.DictStore.Get(key);
+        long value = 0;
+        
+        if (obj != null && !_storage.DictStore.HasExpired(key))
+        {
+            if (!long.TryParse(obj.Value, out value))
+            {
+                return RespEncoder.Encode(new Exception("ERR value is not an integer or out of range"));
+            }
+        }
+        
+        value += delta;
+        var newObj = _storage.DictStore.NewObj(key, value.ToString(), -1);
+        
+        // Preserve TTL if it exists
+        var (expiry, isExpirySet) = _storage.DictStore.GetExpiry(key);
+        if (isExpirySet)
+        {
+            long remainMs = expiry - DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (remainMs > 0)
+            {
+                newObj = _storage.DictStore.NewObj(key, value.ToString(), remainMs);
+            }
+        }
+
+        _storage.DictStore.Set(key, newObj);
+        return RespEncoder.Encode(value, isSimpleString: false);
+    }
 }

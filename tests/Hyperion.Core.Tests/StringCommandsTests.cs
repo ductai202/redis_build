@@ -75,4 +75,16 @@ public class StringCommandsTests
         Assert.NotEqual(":-1\r\n", ttlRes); // Not "no expire"
         Assert.NotEqual(":-2\r\n", ttlRes); // Not "not exists"
     }
+
+    [Fact]
+    public void Incr_And_Decr_ShouldWork()
+    {
+        ExecuteStringCommand("SET", "counter", "10");
+        
+        var incrRes = ExecuteStringCommand("INCR", "counter");
+        Assert.Equal(":11\r\n", incrRes);
+
+        var decrRes = ExecuteStringCommand("DECR", "counter");
+        Assert.Equal(":10\r\n", decrRes);
+    }
 }
