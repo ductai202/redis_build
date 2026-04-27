@@ -121,6 +121,42 @@ public class MultiThreadIntegrationTests : IDisposable
         Assert.Empty(errors);
     }
 
+    [Fact]
+    public void Del_CrossSlot_ShouldWork()
+    {
+        // Set multiple keys that will likely hash to different workers
+        for (int i = 0; i < 20; i++)
+        {
+            var setRes = SendCommand(new[] { "SET", $"key{i}", $"val{i}" });
+            Assert.Equal("+OK\r\n", setRes);
+        }
+
+        // Build a multi-key DEL command
+        var delArgs = new List<string> { "DEL" };
+        for (int i = 0; i < 20; i++)
+        {
+            delArgs.Add($"key{i}");
+        }
+
+        var delRes = SendCommand(delArgs.ToArray());
+        Assert.Equal(":20\r\n", delRes); // Expect 20 keys to be deleted
+    }
+
+    [Fact]
+    public void HashTags_ShouldMapToSameSlot()
+    {
+        // This is a unit test of the GetPartitionId logic implicitly.
+        // We can't directly check the worker ID, but we can verify that cross-slot DEL
+        // still works and correctly deletes when hash tags are used.
+        var setRes1 = SendCommand(new[] { "SET", "{user:1}:name", "Alice" });
+        var setRes2 = SendCommand(new[] { "SET", "{user:1}:age", "30" });
+        Assert.Equal("+OK\r\n", setRes1);
+        Assert.Equal("+OK\r\n", setRes2);
+
+        var delRes = SendCommand(new[] { "DEL", "{user:1}:name", "{user:1}:age" });
+        Assert.Equal(":2\r\n", delRes);
+    }
+
     public void Dispose()
     {
         _cts.Cancel();

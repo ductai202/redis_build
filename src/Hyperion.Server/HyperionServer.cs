@@ -58,28 +58,91 @@ public sealed class HyperionServer
     }
 
     /// <summary>
-    /// Routes the task to the correct worker based on the command's primary key.
+    /// Routes the task to the correct worker. Handles cross-slot routing for multi-key commands like DEL.
     /// </summary>
     public async ValueTask DispatchAsync(WorkerTask task)
     {
-        int workerId = GetPartitionId(task);
-        await _workers[workerId].EnqueueTaskAsync(task);
+        if (task.Command.Cmd == "DEL" && task.Command.Args.Length > 1)
+        {
+            // Scatter-Gather multi-key DEL
+            var groups = task.Command.Args.GroupBy(GetPartitionId).ToList();
+
+            if (groups.Count == 1)
+            {
+                // All keys map to the same worker, dispatch normally
+                await _workers[groups[0].Key].EnqueueTaskAsync(task);
+                return;
+            }
+
+            // Scatter phase
+            var subTasks = new System.Collections.Generic.List<WorkerTask>();
+            foreach (var group in groups)
+            {
+                var subCommand = new Protocol.RespCommand { Cmd = "DEL", Args = System.Linq.Enumerable.ToArray(group) };
+                var subTask = new WorkerTask(subCommand);
+                subTasks.Add(subTask);
+                await _workers[group.Key].EnqueueTaskAsync(subTask);
+            }
+
+            // Gather phase
+            _ = Task.Run(async () =>
+            {
+                long totalDeleted = 0;
+                Exception? error = null;
+
+                foreach (var subTask in subTasks)
+                {
+                    try
+                    {
+                        var responseBytes = await subTask.ReplyCompletion.Task;
+                        string respStr = Encoding.UTF8.GetString(responseBytes);
+                        if (respStr.StartsWith(":") && respStr.EndsWith("\r\n"))
+                        {
+                            if (long.TryParse(respStr.Substring(1, respStr.Length - 3), out long deleted))
+                            {
+                                totalDeleted += deleted;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        error = ex;
+                    }
+                }
+
+                if (error != null)
+                {
+                    task.ReplyCompletion.TrySetException(error);
+                }
+                else
+                {
+                    task.ReplyCompletion.TrySetResult(Protocol.RespEncoder.Encode(totalDeleted, isSimpleString: false));
+                }
+            });
+        }
+        else
+        {
+            int workerId = task.Command.Args.Length > 0 ? GetPartitionId(task.Command.Args[0]) : Random.Shared.Next(_numWorkers);
+            await _workers[workerId].EnqueueTaskAsync(task);
+        }
     }
 
     /// <summary>
-    /// Implements FNV-1a hash to consistently map a key to a specific worker.
-    /// If the command has no keys (e.g., PING), it routes to a random worker.
+    /// Implements Hash Tags (Redis Cluster style) to map related keys to the same worker,
+    /// then uses FNV-1a hash to consistently map the key (or tag) to a specific worker.
     /// </summary>
-    private int GetPartitionId(WorkerTask task)
+    private int GetPartitionId(string key)
     {
-        if (task.Command.Args.Length > 0)
+        int start = key.IndexOf('{');
+        if (start != -1)
         {
-            string key = task.Command.Args[0];
-            return (int)(Fnv1aHash(key) % (uint)_numWorkers);
+            int end = key.IndexOf('}', start + 1);
+            if (end != -1 && end > start + 1)
+            {
+                key = key.Substring(start + 1, end - start - 1);
+            }
         }
-        
-        // Commands without keys (PING, INFO) can go to any worker
-        return Random.Shared.Next(_numWorkers);
+        return (int)(Fnv1aHash(key) % (uint)_numWorkers);
     }
 
     /// <summary>

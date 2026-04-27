@@ -119,6 +119,9 @@ On a machine with 8 logical cores, Hyperion spins up 4 IO handlers + 4 workers. 
 
 We chose **FNV-1a (Fowler-Noll-Vo)** as our partitioning hash because it is a non-cryptographic algorithm that is exceptionally fast and provides high dispersion for short strings (the most common type of Redis keys). This ensures that traffic is balanced evenly across all worker shards with minimal computational overhead, which is critical for maintaining sub-millisecond latencies.
 
+**Multi-Key Commands & Hash Tags**
+To handle commands that span multiple keys (like `DEL key1 key2`), Hyperion implements a **Scatter-Gather** routing engine inspired by Dragonfly. If keys map to different shards, the orchestrator splits the command into sub-tasks, dispatches them concurrently to the appropriate workers, and then aggregates the results. To force related keys to the same shard and avoid scatter-gather overhead, Hyperion supports **Redis Cluster Hash Tags** (e.g., `{user:1}:name` and `{user:1}:age` will always be routed to the same lock-free shard).
+
 No mutexes, no spinlocks, no contention.
 
 ---
