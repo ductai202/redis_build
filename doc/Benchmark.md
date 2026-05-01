@@ -58,11 +58,6 @@ redis-benchmark -p 3001 -t set,get -c 500 -n 1000000 -r 1000000 --threads 3
 
 | Environment | Mode | SET (req/s) | GET (req/s) |
 |---|---|---|---|
-| Windows 11 | Origin Redis 8.6.2 | 17,777 | 18,221 |
-| Windows 11 | Hyperion Single-Thread | 15,841 | 15,389 |
-| Windows 11 | Hyperion Multi-Thread | 30,921 | 26,978 |
-| Windows 11 | Hyperion Single-Thread (100µs Delay) | 15,686 | 18,232 |
-| Windows 11 | Hyperion Multi-Thread (100µs Delay) | 24,374 | 25,308 |
 | **WSL (Linux)** | **Origin Redis 7.4.1** | **78,186** | **117,412** |
 | **WSL (Linux)** | **Hyperion Single-Thread** | **45,785** | **43,425** |
 | **WSL (Linux)** | **Hyperion Multi-Thread** | **94,679** | **113,856** |
@@ -106,16 +101,13 @@ redis-benchmark -p 3001 -t set,get -c 500 -n 1000000 -r 1000000 --threads 3
 ## Analysis
 
 ### Normal Workload (No Delay)
-- **Windows Limitation**: On Windows, pure I/O overhead caps both Origin Redis and Hyperion at around 15k-25k requests per second. At this ceiling, Hyperion Multi-Thread performs noticeably better (~23.8k GET) than Single-Thread (~13.8k GET) and Origin Redis (~18.2k GET).
-- **WSL Linux Performance**: When tested on WSL, the network stack overhead disappears. Origin Redis jumps to **117k GET req/s**. Hyperion Multi-Thread jumps to **99.6k GET req/s** (achieving ~85% of official Redis throughput). Hyperion Single-Thread bottlenecks at around 39k, demonstrating that C#'s single-threaded event loop is compute-bound at that level.
+- **WSL Linux Performance**: When tested on WSL, the network stack overhead is minimal. Origin Redis reaches **117k GET req/s**. Hyperion Multi-Thread reaches **113.8k GET req/s** (achieving ~97% of official Redis throughput). Hyperion Single-Thread bottlenecks at around 43k, demonstrating that C#'s single-threaded event loop is compute-bound at that level on this hardware.
 
 ### Why Multi-Thread Wins Under Load (100µs Delay)
 While single-thread mode is fast for raw I/O, the true power of the "share-nothing" architecture becomes obvious when simulating slow commands (like complex Lua scripts or large dataset scans). By injecting a synthetic **100µs delay** into execution, we observe:
 
 | Environment | Mode | SET (req/s) | GET (req/s) |
 |---|---|---|---|
-| **Windows 11** | Hyperion Single-Thread (100µs) | 15,686 | 18,232 |
-| **Windows 11** | **Hyperion Multi-Thread (100µs)** | **24,374** | **25,308** |
 | **WSL (Linux)** | Hyperion Single-Thread (100µs) | 39,086 | 36,995 |
 | **WSL (Linux)** | **Hyperion Multi-Thread (100µs)** | **92,618** | **106,929** (2.89x faster) |
 

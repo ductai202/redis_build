@@ -161,24 +161,16 @@ OK
 (integer) 0
 ```
 
-Run tests:
-
-```bash
-dotnet test
-```
 
 ---
 
 ## Benchmark
 
-### Benchmark (Windows vs WSL)
+### Benchmark (WSL)
 Tested with `redis-benchmark` (500 clients, 1M requests, 1M keys) on an 8-core machine.
 
 | Environment | Mode | SET (req/s) | GET (req/s) |
 |---|---|---|---|
-| **Windows 11** | Origin Redis 8.6.2 | 17,777 | 18,221 |
-| **Windows 11** | Hyperion Single-Thread | 15,841 | 15,389 |
-| **Windows 11** | **Hyperion Multi-Thread** | **30,921** | **26,978** |
 | **WSL (Ubuntu)** | Origin Redis 7.4.1 | 78,186 | 117,412 |
 | **WSL (Ubuntu)** | Hyperion Single-Thread | 45,785 | 43,425 |
 | **WSL (Ubuntu)** | **Hyperion Multi-Thread** | **94,679** | **113,856** |
@@ -191,19 +183,10 @@ While single-thread mode is fast, the true power of the share-nothing architectu
 | **WSL (Ubuntu)** | Hyperion Single-Thread | 36,995 |
 | **WSL (Ubuntu)** | **Hyperion Multi-Thread** | **106,929** (2.89x faster) |
 
-
 When one command artificially blocks, the share-nothing design prevents other workers from being blocked, ensuring high throughput even under contention.
 
 Full details in [doc/Benchmark.md](doc/Benchmark.md).
 
----
-
-## Documentation
-
-- [Data Structures Deep Dive](doc/DataStructures.md) — how each structure works, the math behind it, and how it maps to the original Redis implementation
-- [Benchmark Report](doc/Benchmark.md) — full methodology and results
-
----
 
 ## What's next
 
