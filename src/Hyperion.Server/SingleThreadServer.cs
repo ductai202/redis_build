@@ -13,16 +13,12 @@ using Microsoft.Extensions.Logging;
 namespace Hyperion.Server;
 
 /// <summary>
-/// True single-threaded RESP server: one dedicated OS thread (pthread on Linux) owns
-/// all command execution. Connections are handled asynchronously (many can be open
-/// simultaneously), but every command is executed sequentially on the single event-loop
-/// thread — exactly like Redis's single-threaded model and Nietzsche's goroutine loop.
-///
-/// Key design:
-/// - NO locks, NO SemaphoreSlim, NO contention of any kind.
-/// - All connections write commands into ONE unbounded Channel.
-/// - ONE LongRunning Task drains the channel and executes commands synchronously.
-/// - Responses are delivered back to the originating connection via TaskCompletionSource.
+/// True single-threaded RESP server.
+/// Key insight for high performance:
+/// - ONE dedicated OS thread (LongRunning) owns all command execution — no locks.
+/// - Responses are batched: all commands parsed from a single read are executed
+///   and written into a PipeWriter buffer, then flushed ONCE per batch.
+///   This eliminates the per-response syscall that was the 15k RPS ceiling.
 /// </summary>
 public sealed class SingleThreadServer
 {
@@ -31,8 +27,6 @@ public sealed class SingleThreadServer
     private readonly int _port;
     private TcpListener? _listener;
 
-    // Single shared work queue. SingleReader=true allows the Channel to skip
-    // concurrency overhead on the consumer side entirely.
     private readonly Channel<WorkItem> _workChannel = Channel.CreateUnbounded<WorkItem>(
         new UnboundedChannelOptions
         {
@@ -47,9 +41,6 @@ public sealed class SingleThreadServer
         _logger = logger;
         _port = port;
 
-        // Start the single event-loop thread immediately.
-        // LongRunning => dedicated OS thread (pthread on Linux), not a ThreadPool worker.
-        // This avoids ThreadPool scheduling jitter and mimics Go's runtime.LockOSThread().
         Task.Factory.StartNew(RunEventLoopAsync, CancellationToken.None,
             TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
@@ -65,17 +56,8 @@ public sealed class SingleThreadServer
             while (!cancellationToken.IsCancellationRequested)
             {
                 TcpClient client;
-                try
-                {
-                    client = await _listener.AcceptTcpClientAsync(cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-
-                // Each connection runs its own async read loop.
-                // It will write command WorkItems to the shared channel and await responses.
+                try { client = await _listener.AcceptTcpClientAsync(cancellationToken); }
+                catch (OperationCanceledException) { break; }
                 _ = Task.Run(() => HandleConnectionAsync(client, cancellationToken), cancellationToken);
             }
         }
@@ -83,14 +65,9 @@ public sealed class SingleThreadServer
         {
             _workChannel.Writer.Complete();
             _listener.Stop();
-            _logger.LogInformation("Hyperion server stopped.");
         }
     }
 
-    /// <summary>
-    /// The single event loop — runs on its own dedicated OS thread.
-    /// Drains WorkItems from the channel, executes them synchronously, and signals completion.
-    /// </summary>
     private async Task RunEventLoopAsync()
     {
         await foreach (var item in _workChannel.Reader.ReadAllAsync())
@@ -100,68 +77,65 @@ public sealed class SingleThreadServer
                 byte[] response = _executor.Execute(item.Command);
                 item.Completion.TrySetResult(response);
             }
-            catch (Exception ex)
-            {
-                item.Completion.TrySetException(ex);
-            }
+            catch (Exception ex) { item.Completion.TrySetException(ex); }
         }
     }
 
     private async Task HandleConnectionAsync(TcpClient client, CancellationToken cancellationToken)
     {
-        var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-        _logger.LogDebug("Client connected: {Endpoint}", endpoint);
-
         using (client)
         {
             var stream = client.GetStream();
             var reader = PipeReader.Create(stream);
+            // PipeWriter buffers writes and flushes in batches — eliminates per-response syscall
+            var writer = PipeWriter.Create(stream);
 
-            try
-            {
-                await ProcessClientAsync(reader, stream, cancellationToken);
-            }
+            try { await ProcessClientAsync(reader, writer, cancellationToken); }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogDebug("Client {Endpoint} disconnected: {Reason}", endpoint, ex.Message);
+                _logger.LogDebug("Client disconnected: {Reason}", ex.Message);
             }
             finally
             {
                 await reader.CompleteAsync();
+                await writer.CompleteAsync();
             }
         }
-
-        _logger.LogDebug("Client disconnected: {Endpoint}", endpoint);
     }
 
-    private async Task ProcessClientAsync(PipeReader reader, NetworkStream stream, CancellationToken cancellationToken)
+    private async Task ProcessClientAsync(PipeReader reader, PipeWriter writer, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             var result = await reader.ReadAsync(cancellationToken);
             var buffer = result.Buffer;
+            bool wroteAny = false;
 
             try
             {
+                // Process ALL complete commands from this read in one batch
                 while (TryParseCommand(ref buffer, out var command))
                 {
                     if (command is not null)
                     {
-                        // Create a work item with RunContinuationsAsynchronously so the
-                        // event-loop thread is never hijacked by the continuation.
                         var item = new WorkItem(command);
-
-                        // Enqueue to the single event-loop thread — never blocks.
                         await _workChannel.Writer.WriteAsync(item, cancellationToken);
-
-                        // Suspend this connection handler until the event loop responds.
                         byte[] response = await item.Completion.Task;
-                        await stream.WriteAsync(response, cancellationToken);
+
+                        // Write into PipeWriter buffer — no syscall yet
+                        writer.Write(response);
+                        wroteAny = true;
                     }
                 }
 
-                if (result.IsCompleted)
-                    break;
+                // Single flush for the entire batch — ONE syscall for all responses
+                if (wroteAny)
+                {
+                    var flushResult = await writer.FlushAsync(cancellationToken);
+                    if (flushResult.IsCompleted) break;
+                }
+
+                if (result.IsCompleted) break;
             }
             finally
             {
@@ -181,14 +155,10 @@ public sealed class SingleThreadServer
         return false;
     }
 
-    /// <summary>
-    /// A single unit of work enqueued by a connection handler and consumed by the event loop.
-    /// </summary>
     private sealed class WorkItem
     {
         public RespCommand Command { get; }
         public TaskCompletionSource<byte[]> Completion { get; }
-
         public WorkItem(RespCommand command)
         {
             Command = command;
