@@ -1,6 +1,22 @@
-using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
 
 namespace Hyperion.DataStructures;
+
+/// <summary>
+/// Coarse-grained clock refreshed by a timer every 10ms.
+/// Eliminates DateTimeOffset.UtcNow syscall from the hot path (GET, SET, INCR, etc.).
+/// Redis uses the same approach: server.unixtime is refreshed once per event-loop tick.
+/// </summary>
+public static class CoarseClock
+{
+    private static long _nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    private static readonly Timer _timer = new(_ =>
+        Interlocked.Exchange(ref _nowMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+        null, 10, 10);
+
+    public static long NowMs => Interlocked.Read(ref _nowMs);
+}
 
 /// <summary>
 /// Represents an object stored in the dictionary.
@@ -16,17 +32,19 @@ public class DictObject
     {
         Key = key;
         Value = value;
-        LastAccessTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        LastAccessTime = CoarseClock.NowMs;
     }
 }
 
 /// <summary>
 /// Core dictionary structure for storing key-value pairs with TTL and eviction support.
+/// Uses plain Dictionary because each Worker owns a private instance (share-nothing model).
+/// No cross-thread access ever occurs — thread safety is guaranteed by the routing layer.
 /// </summary>
 public class Dict
 {
-    private readonly ConcurrentDictionary<string, DictObject> _store = new();
-    private readonly ConcurrentDictionary<string, long> _expiryStore = new();
+    private readonly Dictionary<string, DictObject> _store = new();
+    private readonly Dictionary<string, long> _expiryStore = new();
 
     public DictObject NewObj(string key, string value, long ttlMs)
     {
@@ -37,7 +55,7 @@ public class Dict
             {
                 Stats.HashKeySpaceStat.IncrementExpires();
             }
-            _expiryStore[key] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + ttlMs;
+            _expiryStore[key] = CoarseClock.NowMs + ttlMs;
         }
         return obj;
     }
@@ -55,7 +73,7 @@ public class Dict
     {
         if (_store.TryGetValue(key, out var obj))
         {
-            obj.LastAccessTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            obj.LastAccessTime = CoarseClock.NowMs;
             return obj;
         }
         return null;
@@ -63,11 +81,11 @@ public class Dict
 
     public bool Del(string key)
     {
-        bool removed = _store.TryRemove(key, out _);
+        bool removed = _store.Remove(key);
         if (removed)
         {
             Stats.HashKeySpaceStat.DecrementKey();
-            if (_expiryStore.TryRemove(key, out _))
+            if (_expiryStore.Remove(key))
             {
                 Stats.HashKeySpaceStat.DecrementExpires();
             }
@@ -79,7 +97,7 @@ public class Dict
     {
         if (_expiryStore.TryGetValue(key, out long expiry))
         {
-            if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() > expiry)
+            if (CoarseClock.NowMs > expiry)
             {
                 Del(key);
                 return true;
@@ -94,7 +112,11 @@ public class Dict
         return (expiry, exists);
     }
 
-    public IDictionary<string, long> GetExpireDictStore()
+    /// <summary>
+    /// Returns a snapshot of the expiry store keys for safe iteration.
+    /// Plain Dictionary is not safe to enumerate while modifying, so we snapshot.
+    /// </summary>
+    public IReadOnlyDictionary<string, long> GetExpireDictStore()
     {
         return _expiryStore;
     }

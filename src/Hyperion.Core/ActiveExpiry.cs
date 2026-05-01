@@ -1,9 +1,14 @@
+using System.Collections.Generic;
 using Hyperion.Config;
+using Hyperion.DataStructures;
 
 namespace Hyperion.Core;
 
 /// <summary>
 /// Background task that periodically samples keys and deletes expired ones.
+/// Uses a snapshot of the expiry store keys to safely iterate while the worker
+/// may concurrently modify the dictionary (though in practice it won't since
+/// ActiveExpiry is called from within the same Worker's event loop).
 /// </summary>
 public class ActiveExpiry
 {
@@ -20,26 +25,24 @@ public class ActiveExpiry
         {
             int expiredCount = 0;
             int sampleCountRemain = Constants.ActiveExpireSampleSize;
-            
-            // In a real Redis, this would pick random keys. 
-            // Iterating a ConcurrentDictionary in C# gives a point-in-time snapshot, 
-            // which acts as a pseudo-random sample for this simple implementation.
-            foreach (var kvp in _storage.DictStore.GetExpireDictStore())
+
+            // Take a snapshot of keys to avoid modifying the dictionary while iterating.
+            // ToList() is safe here and only runs on a background expiry sweep, not the hot path.
+            var expiryStore = _storage.DictStore.GetExpireDictStore();
+            var keys = new List<string>(expiryStore.Keys);
+
+            foreach (var key in keys)
             {
-                sampleCountRemain--;
-                if (sampleCountRemain < 0)
+                if (sampleCountRemain-- <= 0) break;
+
+                if (expiryStore.TryGetValue(key, out long expiry) &&
+                    CoarseClock.NowMs > expiry)
                 {
-                    break;
-                }
-                
-                if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() > kvp.Value)
-                {
-                    _storage.DictStore.Del(kvp.Key);
+                    _storage.DictStore.Del(key);
                     expiredCount++;
                 }
             }
 
-            // If the number of expired keys in the sample is less than 10%, we can stop.
             if ((double)expiredCount / Constants.ActiveExpireSampleSize <= Constants.ActiveExpireThreshold)
             {
                 break;

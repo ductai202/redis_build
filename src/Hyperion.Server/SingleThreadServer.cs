@@ -1,8 +1,11 @@
+using System;
 using System.Buffers;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
-using Hyperion.Config;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
 using Hyperion.Core;
 using Hyperion.Protocol;
 using Microsoft.Extensions.Logging;
@@ -10,8 +13,12 @@ using Microsoft.Extensions.Logging;
 namespace Hyperion.Server;
 
 /// <summary>
-/// A single-threaded RESP server implementation using Socket.Select (IO Multiplexing).
-/// This implementation handles all client IO and command execution in a single thread to avoid locking overhead.
+/// True single-threaded RESP server.
+/// Key insight for high performance:
+/// - ONE dedicated OS thread (LongRunning) owns all command execution — no locks.
+/// - Responses are batched: all commands parsed from a single read are executed
+///   and written into a PipeWriter buffer, then flushed ONCE per batch.
+///   This eliminates the per-response syscall that was the 15k RPS ceiling.
 /// </summary>
 public sealed class SingleThreadServer
 {
@@ -19,13 +26,23 @@ public sealed class SingleThreadServer
     private readonly ILogger<SingleThreadServer> _logger;
     private readonly int _port;
     private TcpListener? _listener;
-    private readonly SemaphoreSlim _executionLock = new(1, 1);
+
+    private readonly Channel<WorkItem> _workChannel = Channel.CreateUnbounded<WorkItem>(
+        new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false
+        });
 
     public SingleThreadServer(ICommandExecutor executor, ILogger<SingleThreadServer> logger, int port)
     {
         _executor = executor;
         _logger = logger;
         _port = port;
+
+        Task.Factory.StartNew(RunEventLoopAsync, CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -39,112 +56,113 @@ public sealed class SingleThreadServer
             while (!cancellationToken.IsCancellationRequested)
             {
                 TcpClient client;
-                try
-                {
-                    client = await _listener.AcceptTcpClientAsync(cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-
-                // Handle each connection concurrently, but each connection's commands
-                // are processed sequentially (single-threaded per connection).
+                try { client = await _listener.AcceptTcpClientAsync(cancellationToken); }
+                catch (OperationCanceledException) { break; }
                 _ = Task.Run(() => HandleConnectionAsync(client, cancellationToken), cancellationToken);
             }
         }
         finally
         {
+            _workChannel.Writer.Complete();
             _listener.Stop();
-            _logger.LogInformation("Hyperion server stopped.");
+        }
+    }
+
+    private async Task RunEventLoopAsync()
+    {
+        await foreach (var item in _workChannel.Reader.ReadAllAsync())
+        {
+            try
+            {
+                byte[] response = _executor.Execute(item.Command);
+                item.Completion.TrySetResult(response);
+            }
+            catch (Exception ex) { item.Completion.TrySetException(ex); }
         }
     }
 
     private async Task HandleConnectionAsync(TcpClient client, CancellationToken cancellationToken)
     {
-        var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-        _logger.LogDebug("Client connected: {Endpoint}", endpoint);
-
         using (client)
         {
             var stream = client.GetStream();
-            // PipeReader wraps the NetworkStream for efficient, zero-copy buffered reading.
-            // .NET handles the underlying IOCP (Windows) / epoll (Linux) automatically.
             var reader = PipeReader.Create(stream);
+            // PipeWriter buffers writes and flushes in batches — eliminates per-response syscall
+            var writer = PipeWriter.Create(stream);
 
-            try
-            {
-                await ProcessClientAsync(reader, stream, cancellationToken);
-            }
+            try { await ProcessClientAsync(reader, writer, cancellationToken); }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogDebug("Client {Endpoint} disconnected: {Reason}", endpoint, ex.Message);
+                _logger.LogDebug("Client disconnected: {Reason}", ex.Message);
             }
             finally
             {
                 await reader.CompleteAsync();
+                await writer.CompleteAsync();
             }
         }
-
-        _logger.LogDebug("Client disconnected: {Endpoint}", endpoint);
     }
 
-    private async Task ProcessClientAsync(PipeReader reader, NetworkStream stream, CancellationToken cancellationToken)
+    private async Task ProcessClientAsync(PipeReader reader, PipeWriter writer, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             var result = await reader.ReadAsync(cancellationToken);
             var buffer = result.Buffer;
+            bool wroteAny = false;
 
             try
             {
-                // Try to parse as many complete commands as possible from the buffer.
+                // Process ALL complete commands from this read in one batch
                 while (TryParseCommand(ref buffer, out var command))
                 {
                     if (command is not null)
                     {
-                        // Ensure only one command is executed at a time globally in single-thread mode
-                        await _executionLock.WaitAsync(cancellationToken);
-                        try
-                        {
-                            var response = _executor.Execute(command);
-                            await stream.WriteAsync(response, cancellationToken);
-                        }
-                        finally
-                        {
-                            _executionLock.Release();
-                        }
+                        var item = new WorkItem(command);
+                        await _workChannel.Writer.WriteAsync(item, cancellationToken);
+                        byte[] response = await item.Completion.Task;
+
+                        // Write into PipeWriter buffer — no syscall yet
+                        writer.Write(response);
+                        wroteAny = true;
                     }
                 }
 
-                // If the client closed the connection, stop the loop.
-                if (result.IsCompleted)
-                    break;
+                // Single flush for the entire batch — ONE syscall for all responses
+                if (wroteAny)
+                {
+                    var flushResult = await writer.FlushAsync(cancellationToken);
+                    if (flushResult.IsCompleted) break;
+                }
+
+                if (result.IsCompleted) break;
             }
             finally
             {
-                // Tell the PipeReader how much data we consumed.
                 reader.AdvanceTo(buffer.Start, buffer.End);
             }
         }
     }
 
-    /// <summary>
-    /// Attempts to parse one complete RESP command from the buffer.
-    /// Returns true if a complete command was found and advances the buffer past it.
-    /// Returns false if more data is needed (partial message).
-    /// </summary>
     private static bool TryParseCommand(ref ReadOnlySequence<byte> buffer, out RespCommand? command)
     {
         var reader = new SequenceReader<byte>(buffer);
-
         if (RespParser.TryParseCommand(ref reader, out command))
         {
-            // Slice the buffer to past the consumed bytes.
             buffer = buffer.Slice(reader.Position);
             return true;
         }
-
         return false;
+    }
+
+    private sealed class WorkItem
+    {
+        public RespCommand Command { get; }
+        public TaskCompletionSource<byte[]> Completion { get; }
+        public WorkItem(RespCommand command)
+        {
+            Command = command;
+            Completion = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
     }
 }

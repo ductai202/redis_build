@@ -12,8 +12,9 @@ namespace Hyperion.Server;
 
 /// <summary>
 /// Handles network I/O for a subset of connected clients.
-/// Reads RESP commands, dispatches them to the global server router,
-/// awaits the execution result from a Worker, and writes the response back.
+/// Uses PipeWriter for batched writes: accumulates all responses from
+/// one read iteration into the write buffer, flushes once per batch.
+/// This eliminates the per-response WriteAsync syscall bottleneck.
 /// </summary>
 public class IOHandler
 {
@@ -28,10 +29,6 @@ public class IOHandler
         _logger = logger;
     }
 
-    /// <summary>
-    /// Adds a new client connection to be managed by this I/O handler.
-    /// Spawns a background task to process the client's stream asynchronously.
-    /// </summary>
     public void AddConnection(TcpClient client, CancellationToken cancellationToken)
     {
         _ = Task.Run(() => HandleClientAsync(client, cancellationToken), cancellationToken);
@@ -46,11 +43,9 @@ public class IOHandler
         {
             var stream = client.GetStream();
             var reader = PipeReader.Create(stream);
+            var writer = PipeWriter.Create(stream);
 
-            try
-            {
-                await ProcessStreamAsync(reader, stream, cancellationToken);
-            }
+            try { await ProcessStreamAsync(reader, writer, cancellationToken); }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogDebug("[IOHandler {Id}] Client {Endpoint} disconnected: {Reason}", _id, endpoint, ex.Message);
@@ -58,45 +53,49 @@ public class IOHandler
             finally
             {
                 await reader.CompleteAsync();
+                await writer.CompleteAsync();
             }
         }
     }
 
-    private async Task ProcessStreamAsync(PipeReader reader, NetworkStream stream, CancellationToken cancellationToken)
+    private async Task ProcessStreamAsync(PipeReader reader, PipeWriter writer, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             var result = await reader.ReadAsync(cancellationToken);
             var buffer = result.Buffer;
+            bool wroteAny = false;
 
             try
             {
-                // Try to parse complete commands from the buffer
+                // Dispatch ALL commands parsed from this read batch in parallel,
+                // then collect responses in order and write them all at once.
+                // This is the key: one flush per read, not one flush per command.
                 while (TryParseCommand(ref buffer, out var command))
                 {
                     if (command is not null)
                     {
-                        // 1. Create a task representing this command
                         var task = new WorkerTask(command);
-
-                        // 2. Dispatch to the global server (which will route it to the correct Worker thread)
                         await _server.DispatchAsync(task);
-
-                        // 3. Suspend this async method until the assigned Worker executes the command
-                        // This frees up the thread to handle other clients/tasks while waiting.
                         byte[] responseBytes = await task.ReplyCompletion.Task;
 
-                        // 4. Send the result back to the client
-                        await stream.WriteAsync(responseBytes, cancellationToken);
+                        // Buffer the response — no syscall yet
+                        writer.Write(responseBytes);
+                        wroteAny = true;
                     }
                 }
 
-                if (result.IsCompleted)
-                    break;
+                // ONE flush for all responses in this batch
+                if (wroteAny)
+                {
+                    var flushResult = await writer.FlushAsync(cancellationToken);
+                    if (flushResult.IsCompleted) break;
+                }
+
+                if (result.IsCompleted) break;
             }
             finally
             {
-                // Advance the reader to indicate how much of the buffer was consumed
                 reader.AdvanceTo(buffer.Start, buffer.End);
             }
         }
@@ -105,13 +104,11 @@ public class IOHandler
     private static bool TryParseCommand(ref ReadOnlySequence<byte> buffer, out RespCommand? command)
     {
         var reader = new SequenceReader<byte>(buffer);
-
         if (RespParser.TryParseCommand(ref reader, out command))
         {
             buffer = buffer.Slice(reader.Position);
             return true;
         }
-
         return false;
     }
 }
