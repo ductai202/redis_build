@@ -4,7 +4,7 @@ A Redis-compatible in-memory database, built from scratch in C#/.NET 10.
 
 I started this project to deeply understand how Redis works under the hood — not just the API, but the internals: how it parses the wire protocol, manages key expiry, how a Skip List enables O(log N) ranked queries, and why single-threaded servers can outperform naively multi-threaded ones.
 
-The multi-threaded mode uses a **share-nothing architecture** — each worker thread owns a private data shard with no locks on the hot path. The single-threaded mode uses a **true event-loop** design: one dedicated OS thread owns all command execution, fed by async IO handlers through a lock-free channel.
+The **single-threaded mode** follows Redis's original architecture — a true event-loop design where one dedicated OS thread owns all command execution, fed by async IO handlers through a lock-free channel. The **multi-threaded mode** is inspired by [DragonflyDB](https://www.dragonflydb.io/)'s share-nothing architecture — each worker thread owns a private data shard with no locks, no contention, and no cross-thread coordination on the hot path.
 
 Hyperion speaks standard RESP2, so you can connect with any `redis-cli` or Redis client library.
 
@@ -36,8 +36,8 @@ Hyperion speaks standard RESP2, so you can connect with any `redis-cli` or Redis
 | Count-Min Sketch | `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY` |
 
 **Server modes:**
-- **Single-threaded** — One dedicated OS thread owns all command execution. Async IO handlers feed commands through a lock-free `Channel`. Responses are batched with `PipeWriter` — one flush per read batch.
-- **Multi-threaded (share-nothing)** — N worker threads each own a private storage shard. IO Handlers route commands via FNV-1a hash, collect results and batch-flush responses with `PipeWriter`.
+- **Single-threaded** — Follows Redis's original event-loop architecture. One dedicated OS thread owns all command execution. Async IO handlers feed commands through a lock-free `Channel`. Responses are batched with `PipeWriter` — one flush per read batch.
+- **Multi-threaded (share-nothing)** — Inspired by [DragonflyDB](https://www.dragonflydb.io/). N worker threads each own a private storage shard. IO Handlers route commands via FNV-1a hash. No mutexes, no spinlocks, no contention on the hot path.
 
 **Key expiry** — Both lazy (check on access) and active (background sweep sampling and deleting expired keys).
 
@@ -47,7 +47,9 @@ Hyperion speaks standard RESP2, so you can connect with any `redis-cli` or Redis
 
 ### Single-Thread Mode
 
-The goal is simple: **one thread, zero locks, maximum cache locality.**
+Follows **Redis's original event-loop architecture**. The goal is simple: **one thread, zero locks, maximum cache locality.**
+
+Redis has always used a single-threaded event loop for command execution — `ae.c` in the Redis source. The reasons are well understood: no lock overhead, no cache line bouncing, deterministic execution order. Hyperion applies the same principle but uses C#'s `Channel<T>` and `LongRunning` task instead of `epoll`/`kqueue`.
 
 #### 1. Connection Layer
 The `TcpListener` accepts connections. For each client, a lightweight `async Task` (managed by the .NET thread pool) handles IO — reading bytes from the socket using `PipeReader`.
@@ -69,7 +71,7 @@ flowchart LR
     CH -->|SingleReader| EL["Event Loop Thread\nLongRunning pthread"]
     EL --> CE[CommandExecutor]
     CE --> ST[("Storage\nplain Dictionary")]
-    ST -->|result byte| EL
+    ST -->|result bytes| EL
     EL -->|"TCS.TrySetResult"| IH
 ```
 
@@ -88,10 +90,14 @@ flowchart LR
 
 ### Multi-Thread Mode (Share-Nothing)
 
-The goal: **scale across CPU cores with zero cross-thread data sharing.**
+Inspired by [DragonflyDB](https://www.dragonflydb.io/)'s share-nothing architecture. The goal: **scale across CPU cores with zero cross-thread data sharing.**
+
+DragonflyDB (C++) proved that the right answer to multi-core scaling is not adding locks to a single store — it is eliminating shared state entirely. Each worker owns its own private shard, and keys are deterministically routed to shards via hash. Hyperion applies the same design in C#/.NET.
+
+On an 8-core machine Hyperion spins up 8 Workers and 4 IO Handlers. Since a key always maps to the same Worker via FNV-1a hash, storage shards are completely isolated — no locking is ever needed.
 
 #### 1. Connection Layer
-`HyperionServer` accepts connections and distributes them to IO Handlers in **round-robin**. Each `IOHandler` is an async loop that reads from its assigned clients using `PipeReader`.
+`HyperionServer` accepts connections and distributes them to IO Handlers in **round-robin** using `Interlocked.Increment`. Each `IOHandler` is an async loop that reads from its assigned clients using `PipeReader`.
 
 ```mermaid
 flowchart LR
@@ -103,16 +109,18 @@ flowchart LR
 ```
 
 #### 2. Routing & Execution Layer
-Each `IOHandler` parses commands and calls `HyperionServer.DispatchAsync()`. The dispatcher extracts the key, resolves any Hash Tag (`{tag}` syntax), runs FNV-1a hash, and enqueues the `WorkerTask` to the matching Worker's `Channel`. Each Worker is a `LongRunning` thread with its own **private** `Storage` — no locking ever needed.
+Each `IOHandler` parses commands and calls `HyperionServer.DispatchAsync()`. The dispatcher resolves any **Hash Tag** (`{tag}` syntax, same as Redis Cluster), runs FNV-1a hash mod N, and enqueues the `WorkerTask` to the matching Worker's `Channel`. Each Worker is a `LongRunning` thread with its own **private** `Storage` — no locking needed.
+
+**FNV-1a** (Fowler-Noll-Vo) is used because it is extremely fast for short strings (the most common key type), provides excellent distribution, and uses `stackalloc Span<byte>` for zero heap allocation per routing call.
 
 ```mermaid
 flowchart TD
     IH["IOHandler\n(parses RESP)"]
     -->|"DispatchAsync WorkerTask"| RT
 
-    subgraph RT["Router: HyperionServer.DispatchAsync"]
+    subgraph RT["Router — HyperionServer.DispatchAsync"]
         HT["1. Resolve Hash Tag\n{tag} extraction"]
-        FNV["2. FNV-1a hash mod N\nstackalloc — zero alloc"]
+        FNV["2. FNV-1a hash mod N\nstackalloc — zero heap alloc"]
         HT --> FNV
     end
 
@@ -121,32 +129,38 @@ flowchart TD
     FNV -->|"key % N = N"| WN
 
     subgraph W0[Worker 0]
-        CH0[Channel WorkItem] --> EL0[LongRunning Thread]
-        EL0 --> S0[(Shard 0\nDictionary)]
+        CH0["Channel WorkItem"] --> EL0["LongRunning Thread"]
+        EL0 --> S0[("Shard 0\nDictionary")]
     end
     subgraph W1[Worker 1]
-        CH1[Channel WorkItem] --> EL1[LongRunning Thread]
-        EL1 --> S1[(Shard 1\nDictionary)]
+        CH1["Channel WorkItem"] --> EL1["LongRunning Thread"]
+        EL1 --> S1[("Shard 1\nDictionary")]
     end
     subgraph WN[Worker N]
-        CHN[Channel WorkItem] --> ELN[LongRunning Thread]
-        ELN --> SN[(Shard N\nDictionary)]
+        CHN["Channel WorkItem"] --> ELN["LongRunning Thread"]
+        ELN --> SN[("Shard N\nDictionary")]
     end
 ```
 
-**Special case — multi-key `DEL`:** If keys map to different shards, the dispatcher does a **Scatter-Gather**: splits the command into per-shard sub-tasks, dispatches them all concurrently, awaits all results, then sums the deleted count and resolves the original `TaskCompletionSource`.
+**Multi-Key Commands — Scatter-Gather:** For commands like `DEL key1 key2` where keys map to different shards, `DispatchAsync` splits the command into per-shard sub-tasks, dispatches them all concurrently, then aggregates results — inspired by [Dragonfly's transaction model](https://www.dragonflydb.io/blog/transactions-in-dragonfly). **Hash Tags** (e.g. `{user:1}:name` and `{user:1}:age`) force related keys to the same shard to avoid cross-shard overhead entirely.
 
 #### 3. Response Layer
-Same as single-thread: `IOHandler` collects all `TCS` results from the current read batch, writes them into a `PipeWriter` buffer, and flushes once.
+Same as single-thread: the `IOHandler` awaits all `TCS` results for the current read batch, writes them into a `PipeWriter` buffer, and flushes once.
 
 ```mermaid
 flowchart LR
-    W["Worker N\n(TCS.TrySetResult)"]
+    W["Worker N\nTCS.TrySetResult"]
     -->|"await task.ReplyCompletion"| IH["IOHandler"]
-    IH -->|"PipeWriter.Write\n(buffered)"| PW[PipeWriter]
+    IH -->|"PipeWriter.Write\n(buffered, no syscall)"| PW[PipeWriter]
     PW -->|"FlushAsync\nONE syscall per batch"| NET[NetworkStream]
     NET --> C[Client]
 ```
+
+**References:**
+- [Redis internals: ae.c event loop](https://github.com/redis/redis/blob/unstable/src/ae.c)
+- [DragonflyDB: Share-Nothing Architecture](https://www.dragonflydb.io/docs/about/faq)
+- [DragonflyDB: Transactions & Scatter-Gather](https://www.dragonflydb.io/blog/transactions-in-dragonfly)
+- [VLL: A Lock Manager Designed for Main Memory Database Systems](https://www.cs.umd.edu/~abadi/papers/vldbj-vll.pdf) — the research behind Dragonfly's multi-key coordination
 
 ---
 
@@ -187,6 +201,12 @@ OK
 (integer) 2
 127.0.0.1:3000> ZRANK leaderboard "alice"
 (integer) 0
+```
+
+## Run Tests
+
+```bash
+dotnet test
 ```
 
 ---
