@@ -1,8 +1,11 @@
+using System;
 using System.Buffers;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
-using Hyperion.Config;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
 using Hyperion.Core;
 using Hyperion.Protocol;
 using Microsoft.Extensions.Logging;
@@ -10,8 +13,16 @@ using Microsoft.Extensions.Logging;
 namespace Hyperion.Server;
 
 /// <summary>
-/// A single-threaded RESP server implementation using Socket.Select (IO Multiplexing).
-/// This implementation handles all client IO and command execution in a single thread to avoid locking overhead.
+/// True single-threaded RESP server: one dedicated OS thread (pthread on Linux) owns
+/// all command execution. Connections are handled asynchronously (many can be open
+/// simultaneously), but every command is executed sequentially on the single event-loop
+/// thread — exactly like Redis's single-threaded model and Nietzsche's goroutine loop.
+///
+/// Key design:
+/// - NO locks, NO SemaphoreSlim, NO contention of any kind.
+/// - All connections write commands into ONE unbounded Channel.
+/// - ONE LongRunning Task drains the channel and executes commands synchronously.
+/// - Responses are delivered back to the originating connection via TaskCompletionSource.
 /// </summary>
 public sealed class SingleThreadServer
 {
@@ -19,13 +30,28 @@ public sealed class SingleThreadServer
     private readonly ILogger<SingleThreadServer> _logger;
     private readonly int _port;
     private TcpListener? _listener;
-    private readonly SemaphoreSlim _executionLock = new(1, 1);
+
+    // Single shared work queue. SingleReader=true allows the Channel to skip
+    // concurrency overhead on the consumer side entirely.
+    private readonly Channel<WorkItem> _workChannel = Channel.CreateUnbounded<WorkItem>(
+        new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false
+        });
 
     public SingleThreadServer(ICommandExecutor executor, ILogger<SingleThreadServer> logger, int port)
     {
         _executor = executor;
         _logger = logger;
         _port = port;
+
+        // Start the single event-loop thread immediately.
+        // LongRunning => dedicated OS thread (pthread on Linux), not a ThreadPool worker.
+        // This avoids ThreadPool scheduling jitter and mimics Go's runtime.LockOSThread().
+        Task.Factory.StartNew(RunEventLoopAsync, CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -48,15 +74,36 @@ public sealed class SingleThreadServer
                     break;
                 }
 
-                // Handle each connection concurrently, but each connection's commands
-                // are processed sequentially (single-threaded per connection).
+                // Each connection runs its own async read loop.
+                // It will write command WorkItems to the shared channel and await responses.
                 _ = Task.Run(() => HandleConnectionAsync(client, cancellationToken), cancellationToken);
             }
         }
         finally
         {
+            _workChannel.Writer.Complete();
             _listener.Stop();
             _logger.LogInformation("Hyperion server stopped.");
+        }
+    }
+
+    /// <summary>
+    /// The single event loop — runs on its own dedicated OS thread.
+    /// Drains WorkItems from the channel, executes them synchronously, and signals completion.
+    /// </summary>
+    private async Task RunEventLoopAsync()
+    {
+        await foreach (var item in _workChannel.Reader.ReadAllAsync())
+        {
+            try
+            {
+                byte[] response = _executor.Execute(item.Command);
+                item.Completion.TrySetResult(response);
+            }
+            catch (Exception ex)
+            {
+                item.Completion.TrySetException(ex);
+            }
         }
     }
 
@@ -68,8 +115,6 @@ public sealed class SingleThreadServer
         using (client)
         {
             var stream = client.GetStream();
-            // PipeReader wraps the NetworkStream for efficient, zero-copy buffered reading.
-            // .NET handles the underlying IOCP (Windows) / epoll (Linux) automatically.
             var reader = PipeReader.Create(stream);
 
             try
@@ -98,53 +143,56 @@ public sealed class SingleThreadServer
 
             try
             {
-                // Try to parse as many complete commands as possible from the buffer.
                 while (TryParseCommand(ref buffer, out var command))
                 {
                     if (command is not null)
                     {
-                        // Ensure only one command is executed at a time globally in single-thread mode
-                        await _executionLock.WaitAsync(cancellationToken);
-                        try
-                        {
-                            var response = _executor.Execute(command);
-                            await stream.WriteAsync(response, cancellationToken);
-                        }
-                        finally
-                        {
-                            _executionLock.Release();
-                        }
+                        // Create a work item with RunContinuationsAsynchronously so the
+                        // event-loop thread is never hijacked by the continuation.
+                        var item = new WorkItem(command);
+
+                        // Enqueue to the single event-loop thread — never blocks.
+                        await _workChannel.Writer.WriteAsync(item, cancellationToken);
+
+                        // Suspend this connection handler until the event loop responds.
+                        byte[] response = await item.Completion.Task;
+                        await stream.WriteAsync(response, cancellationToken);
                     }
                 }
 
-                // If the client closed the connection, stop the loop.
                 if (result.IsCompleted)
                     break;
             }
             finally
             {
-                // Tell the PipeReader how much data we consumed.
                 reader.AdvanceTo(buffer.Start, buffer.End);
             }
         }
     }
 
-    /// <summary>
-    /// Attempts to parse one complete RESP command from the buffer.
-    /// Returns true if a complete command was found and advances the buffer past it.
-    /// Returns false if more data is needed (partial message).
-    /// </summary>
     private static bool TryParseCommand(ref ReadOnlySequence<byte> buffer, out RespCommand? command)
     {
         var reader = new SequenceReader<byte>(buffer);
-
         if (RespParser.TryParseCommand(ref reader, out command))
         {
-            // Slice the buffer to past the consumed bytes.
             buffer = buffer.Slice(reader.Position);
             return true;
         }
-
         return false;
+    }
+
+    /// <summary>
+    /// A single unit of work enqueued by a connection handler and consumed by the event loop.
+    /// </summary>
+    private sealed class WorkItem
+    {
+        public RespCommand Command { get; }
+        public TaskCompletionSource<byte[]> Completion { get; }
+
+        public WorkItem(RespCommand command)
+        {
+            Command = command;
+            Completion = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
     }
 }

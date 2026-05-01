@@ -35,21 +35,18 @@ public sealed class HyperionServer
         _logger = loggerFactory.CreateLogger<HyperionServer>();
         _port = port;
 
-        // Default to half cores for workers, half for IO handlers (similar to Dragonfly/Nietzsche)
         int processorCount = Environment.ProcessorCount;
         _numWorkers = numWorkers > 0 ? numWorkers : Math.Max(1, processorCount / 2);
         _numIOHandlers = numIOHandlers > 0 ? numIOHandlers : Math.Max(1, processorCount / 2);
 
         _logger.LogInformation("Initializing Multi-Threaded Server. Workers: {Workers}, IO Handlers: {IOHandlers}", _numWorkers, _numIOHandlers);
 
-        // Initialize Workers
         _workers = new Worker[_numWorkers];
         for (int i = 0; i < _numWorkers; i++)
         {
             _workers[i] = new Worker(i, bufferSize: 10000, delayUs: delayUs);
         }
 
-        // Initialize IO Handlers
         _ioHandlers = new IOHandler[_numIOHandlers];
         for (int i = 0; i < _numIOHandlers; i++)
         {
@@ -64,17 +61,14 @@ public sealed class HyperionServer
     {
         if (task.Command.Cmd == "DEL" && task.Command.Args.Length > 1)
         {
-            // Scatter-Gather multi-key DEL
             var groups = task.Command.Args.GroupBy(GetPartitionId).ToList();
 
             if (groups.Count == 1)
             {
-                // All keys map to the same worker, dispatch normally
                 await _workers[groups[0].Key].EnqueueTaskAsync(task);
                 return;
             }
 
-            // Scatter phase
             var subTasks = new System.Collections.Generic.List<WorkerTask>();
             foreach (var group in groups)
             {
@@ -84,7 +78,6 @@ public sealed class HyperionServer
                 await _workers[group.Key].EnqueueTaskAsync(subTask);
             }
 
-            // Gather phase
             _ = Task.Run(async () =>
             {
                 long totalDeleted = 0;
@@ -111,26 +104,20 @@ public sealed class HyperionServer
                 }
 
                 if (error != null)
-                {
                     task.ReplyCompletion.TrySetException(error);
-                }
                 else
-                {
                     task.ReplyCompletion.TrySetResult(Protocol.RespEncoder.Encode(totalDeleted, isSimpleString: false));
-                }
             });
         }
         else
         {
-            int workerId = task.Command.Args.Length > 0 ? GetPartitionId(task.Command.Args[0]) : Random.Shared.Next(_numWorkers);
+            int workerId = task.Command.Args.Length > 0
+                ? GetPartitionId(task.Command.Args[0])
+                : Random.Shared.Next(_numWorkers);
             await _workers[workerId].EnqueueTaskAsync(task);
         }
     }
 
-    /// <summary>
-    /// Implements Hash Tags (Redis Cluster style) to map related keys to the same worker,
-    /// then uses FNV-1a hash to consistently map the key (or tag) to a specific worker.
-    /// </summary>
     private int GetPartitionId(string key)
     {
         int start = key.IndexOf('{');
@@ -146,16 +133,9 @@ public sealed class HyperionServer
     }
 
     /// <summary>
-    /// Implements the FNV-1a (Fowler-Noll-Vo) hash algorithm.
-    /// 
-    /// Why FNV-1a?
-    /// 1. Speed: It is a non-cryptographic hash that is extremely fast, making it ideal for 
-    ///    the hot path of a high-performance database.
-    /// 2. Distribution: It provides excellent distribution for short strings (common for Redis keys),
-    ///    ensuring even load balancing across worker shards.
-    /// 3. Simplicity: The algorithm is small and requires no complex look-up tables or external dependencies.
-    /// 4. Share-Nothing: It provides the deterministic routing required to ensure a key 
-    ///    always maps to the same worker thread without cross-thread coordination.
+    /// FNV-1a hash using stackalloc — zero heap allocation per routing call.
+    /// Previous version called Encoding.UTF8.GetBytes(key) which allocated a new byte[]
+    /// on every single command dispatch (100k+ allocations/sec at target RPS).
     /// </summary>
     private static uint Fnv1aHash(string key)
     {
@@ -163,20 +143,35 @@ public sealed class HyperionServer
         const uint fnvOffsetBasis = 2166136261;
 
         uint hash = fnvOffsetBasis;
-        byte[] bytes = Encoding.UTF8.GetBytes(key);
-        
-        foreach (byte b in bytes)
+
+        // stackalloc: bytes live on the stack frame, zero GC pressure.
+        // 256 bytes covers keys up to 256 chars in ASCII/UTF-8 single-byte range.
+        // For longer keys (rare), fall back to heap array.
+        int maxBytes = Encoding.UTF8.GetMaxByteCount(key.Length);
+        if (maxBytes <= 256)
         {
-            hash ^= b;
-            hash *= fnvPrime;
+            Span<byte> bytes = stackalloc byte[maxBytes];
+            int written = Encoding.UTF8.GetBytes(key, bytes);
+            for (int i = 0; i < written; i++)
+            {
+                hash ^= bytes[i];
+                hash *= fnvPrime;
+            }
+        }
+        else
+        {
+            // Fallback for very long keys (>~85 chars with multibyte chars)
+            byte[] bytes = Encoding.UTF8.GetBytes(key);
+            foreach (byte b in bytes)
+            {
+                hash ^= b;
+                hash *= fnvPrime;
+            }
         }
 
         return hash;
     }
 
-    /// <summary>
-    /// Starts accepting incoming connections and round-robins them to the IO Handlers.
-    /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _listener = new TcpListener(IPAddress.Any, _port);
@@ -197,12 +192,7 @@ public sealed class HyperionServer
                     break;
                 }
 
-                // Round-robin assignment to an IO Handler
-                int ioHandlerIndex = Interlocked.Increment(ref _nextIOHandlerIndex) % _numIOHandlers;
-                
-                // Absolute value to handle potential integer overflow turning negative
-                ioHandlerIndex = Math.Abs(ioHandlerIndex);
-                
+                int ioHandlerIndex = Math.Abs(Interlocked.Increment(ref _nextIOHandlerIndex) % _numIOHandlers);
                 _ioHandlers[ioHandlerIndex].AddConnection(client, cancellationToken);
             }
         }
