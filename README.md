@@ -22,6 +22,8 @@ Hyperion speaks standard RESP2, so you can connect with any `redis-cli` or Redis
 - **Count-Min Sketch** — Frequency estimation with configurable error/probability bounds
 - **Eviction Pool** — Sampling-based approximate LRU (Redis's approach of sampling keys instead of maintaining a full LRU list)
 
+For the algorithm breakdown, Redis equivalence, and complexity analysis of each structure, see [doc/DataStructures.md](doc/DataStructures.md).
+
 **Commands:**
 
 | Category | Commands |
