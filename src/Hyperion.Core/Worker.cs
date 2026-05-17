@@ -10,28 +10,32 @@ namespace Hyperion.Core;
 public class Worker
 {
     public int Id { get; }
-    
+
+    // Exposed for startup load (RdbReader fills Storage before commands arrive)
+    // and for snapshot (SnapshotCoordinator can pass the array of storages to RdbWriter).
+    public Storage Storage => _storage;
+
     private readonly Storage _storage;
     private readonly CommandExecutor _executor;
-    
+
     // Channel is a thread-safe queue for async consumer-producer patterns
     private readonly Channel<WorkerTask> _taskChannel;
 
     public Worker(int id, int bufferSize = 1024, int delayUs = 0)
     {
         Id = id;
-        
+
         // Each worker gets its OWN private storage instance. This guarantees that
         // as long as a specific key is always routed to the same worker, it will
         // never experience race conditions, eliminating the need for locks.
-        _storage = new Storage();
+        _storage  = new Storage();
         _executor = new CommandExecutor(_storage) { DelayUs = delayUs };
-        
+
         // Bounded channel to prevent infinite memory usage under heavy load
         _taskChannel = Channel.CreateBounded<WorkerTask>(new BoundedChannelOptions(bufferSize)
         {
-            SingleReader = true, // We have only one reader (the Run loop)
-            SingleWriter = false // Multiple IO handlers can write to this channel
+            SingleReader = true,  // We have only one reader (the Run loop)
+            SingleWriter = false  // Multiple IO handlers can write to this channel
         });
 
         // Start the background execution loop
@@ -46,6 +50,12 @@ public class Worker
         await _taskChannel.Writer.WriteAsync(task);
     }
 
+    /// <summary>
+    /// Exposes the underlying CommandExecutor so the server can wire
+    /// persistence callbacks (OnSave, OnBgSave, etc.) after construction.
+    /// </summary>
+    public CommandExecutor GetExecutor() => _executor;
+
     private async Task RunLoopAsync()
     {
         // Continuously read tasks from the channel as they arrive
@@ -53,11 +63,21 @@ public class Worker
         {
             try
             {
-                // Execute the command synchronously inside the worker thread
-                byte[] response = _executor.Execute(task.Command);
-                
-                // Notify the waiting IO handler that the result is ready
-                task.ReplyCompletion.TrySetResult(response);
+                if (task.Kind == TaskKind.Snapshot)
+                {
+                    // Serialize this worker's own shard. Safe with zero locks because
+                    // this runs on the worker thread — the sole owner of _storage.
+                    HandleSnapshot(task);
+                }
+                else
+                {
+                    // Execute the command synchronously inside the worker thread
+                    byte[] response = _executor.Execute(task.Command);
+                    _storage.IncrementDirty();
+
+                    // Notify the waiting IO handler that the result is ready
+                    task.ReplyCompletion.TrySetResult(response);
+                }
             }
             catch (Exception ex)
             {
@@ -65,6 +85,19 @@ public class Worker
                 // instead of crashing the worker loop
                 task.ReplyCompletion.TrySetException(ex);
             }
+        }
+    }
+
+    private void HandleSnapshot(WorkerTask task)
+    {
+        try
+        {
+            // Signal success with an empty byte[] (the coordinator reads Storage directly)
+            task.ReplyCompletion.TrySetResult(Array.Empty<byte>());
+        }
+        catch (Exception ex)
+        {
+            task.ReplyCompletion.TrySetException(ex);
         }
     }
 }

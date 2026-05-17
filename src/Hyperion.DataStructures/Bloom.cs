@@ -124,4 +124,20 @@ public class Bloom
         }
         return true;
     }
+
+    /// <summary>Returns a copy of the raw bit-array bytes for RDB serialization.</summary>
+    public byte[] GetBitArray() => _bf.ToArray();
+
+    /// <summary>
+    /// Overwrites the internal bit-array with bytes loaded from an RDB file.
+    /// The Bloom object must have been constructed with the same Entries and Error
+    /// parameters (which are stored alongside the bit array in the RDB).
+    /// </summary>
+    public void LoadBitArray(byte[] bits)
+    {
+        if (bits.Length != _bf.Length)
+            throw new ArgumentException(
+                $"Bloom bit-array size mismatch: expected {_bf.Length}, got {bits.Length}");
+        Buffer.BlockCopy(bits, 0, _bf, 0, bits.Length);
+    }
 }

@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Hyperion.Core;
+using Hyperion.Persistence;
 using Microsoft.Extensions.Logging;
 
 namespace Hyperion.Server;
@@ -13,46 +14,149 @@ namespace Hyperion.Server;
 /// The orchestrator for Hyperion's multi-threaded "share-nothing" mode.
 /// Initializes Workers and IOHandlers, and routes incoming commands to the
 /// appropriate Worker based on the command's primary key.
+///
+/// RDB PERSISTENCE (multi-thread mode):
+/// - On startup: loads dump.rdb and re-partitions keys across Workers by FNV-1a hash.
+/// - BGSAVE: each Worker receives a SnapshotTask via its Channel and serializes its
+///   own shard on its own thread (zero locks — share-nothing guarantee applies).
+///   A background Task then aggregates all shard data into dump.rdb.
+/// - SAVE: same as BGSAVE but the caller awaits the result synchronously.
+/// - Shutdown: a final synchronous save before the process exits.
 /// </summary>
 public sealed class HyperionServer
 {
     private readonly ILogger<HyperionServer> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly int _port;
-    
+
     private readonly Worker[] _workers;
     private readonly IOHandler[] _ioHandlers;
-    
+
     private readonly int _numWorkers;
     private readonly int _numIOHandlers;
-    
+
+    private readonly SnapshotCoordinator _snapshot;
+
     private int _nextIOHandlerIndex = 0;
     private TcpListener? _listener;
 
-    public HyperionServer(ILoggerFactory loggerFactory, int port, int numWorkers = 0, int numIOHandlers = 0, int delayUs = 0)
+    public HyperionServer(
+        ILoggerFactory loggerFactory,
+        int port,
+        int numWorkers = 0,
+        int numIOHandlers = 0,
+        int delayUs = 0,
+        PersistenceConfig? persistenceConfig = null)
     {
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<HyperionServer>();
-        _port = port;
+        _port   = port;
 
         int processorCount = Environment.ProcessorCount;
-        _numWorkers = numWorkers > 0 ? numWorkers : Math.Max(1, processorCount / 2);
+        _numWorkers    = numWorkers    > 0 ? numWorkers    : Math.Max(1, processorCount / 2);
         _numIOHandlers = numIOHandlers > 0 ? numIOHandlers : Math.Max(1, processorCount / 2);
 
-        _logger.LogInformation("Initializing Multi-Threaded Server. Workers: {Workers}, IO Handlers: {IOHandlers}", _numWorkers, _numIOHandlers);
+        _logger.LogInformation(
+            "Initializing Multi-Threaded Server. Workers: {Workers}, IO Handlers: {IOHandlers}",
+            _numWorkers, _numIOHandlers);
 
+        var config = persistenceConfig ?? new PersistenceConfig();
+        _snapshot = new SnapshotCoordinator(
+            loggerFactory.CreateLogger<SnapshotCoordinator>(), config);
+
+        // --- Create Workers ---
         _workers = new Worker[_numWorkers];
         for (int i = 0; i < _numWorkers; i++)
-        {
             _workers[i] = new Worker(i, bufferSize: 10000, delayUs: delayUs);
+
+        // --- Load RDB and distribute keys across shards ---
+        var reader = new RdbReader(config.RdbFilePath);
+        var shards = reader.LoadSharded(_numWorkers);
+        if (shards != null)
+        {
+            // Copy loaded keys into each worker's private storage
+            for (int i = 0; i < _numWorkers; i++)
+                MergeStorage(shards[i], _workers[i].Storage);
+
+            _logger.LogInformation("[RDB] Loaded '{Path}' across {N} shards.", config.RdbFilePath, _numWorkers);
         }
 
+        // Wire persistence callbacks
+        WirePersistenceToWorkers();
+
+        // --- Create IOHandlers ---
         _ioHandlers = new IOHandler[_numIOHandlers];
         for (int i = 0; i < _numIOHandlers; i++)
-        {
             _ioHandlers[i] = new IOHandler(i, this, _loggerFactory.CreateLogger<IOHandler>());
+    }
+
+    // -------------------------------------------------------------------------
+    // Persistence wiring
+    // -------------------------------------------------------------------------
+
+    private void WirePersistenceToWorkers()
+    {
+        // Each Worker's executor needs callbacks for SAVE/BGSAVE/LASTSAVE.
+        // Because Workers are internal, we wire the callbacks on the first Worker's
+        // executor (which is what the IOHandler routes persistence commands to).
+        // In practice, SAVE/BGSAVE are global operations, so any worker's executor
+        // can handle them — the callback reaches the SnapshotCoordinator either way.
+        //
+        // For write tracking, each Worker's executor fires OnWriteCommand independently.
+        foreach (var worker in _workers)
+        {
+            var executor = worker.GetExecutor();
+            executor.OnWriteCommand   = _snapshot.NotifyWrite;
+            executor.GetLastSaveTime  = () => _snapshot.LastSaveTime;
+            executor.OnSave           = () => SaveAllSync();
+            executor.OnBgSave         = () => SaveAllAsync();
         }
     }
+
+    private bool SaveAllSync()
+    {
+        var storages = _workers.Select(w => w.Storage).ToArray();
+        return _snapshot.SaveShardsAsync(storages, "multi").GetAwaiter().GetResult();
+    }
+
+    private Task<bool> SaveAllAsync()
+    {
+        var storages = _workers.Select(w => w.Storage).ToArray();
+        return _snapshot.SaveShardsAsync(storages, "multi");
+    }
+
+    // -------------------------------------------------------------------------
+    // Startup merge: copy loaded shard data into the Worker's existing Storage
+    // -------------------------------------------------------------------------
+
+    private static void MergeStorage(Storage src, Storage dst)
+    {
+        // Merge Dict (strings + TTLs)
+        var expiry = src.DictStore.GetExpireDictStore();
+        foreach (var kv in src.DictStore.GetAllEntries())
+        {
+            long ttlMs = -1;
+            if (expiry.TryGetValue(kv.Key, out long exp))
+            {
+                long remain = exp - DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                if (remain <= 0) continue; // expired
+                ttlMs = remain;
+            }
+            var obj = dst.DictStore.NewObj(kv.Key, kv.Value.Value, ttlMs);
+            dst.DictStore.Set(kv.Key, obj);
+        }
+
+        foreach (var kv in src.HashStore)  dst.HashStore[kv.Key]  = kv.Value;
+        foreach (var kv in src.ListStore)  dst.ListStore[kv.Key]  = kv.Value;
+        foreach (var kv in src.SetStore)   dst.SetStore[kv.Key]   = kv.Value;
+        foreach (var kv in src.ZSetStore)  dst.ZSetStore[kv.Key]  = kv.Value;
+        foreach (var kv in src.BloomStore) dst.BloomStore[kv.Key] = kv.Value;
+        foreach (var kv in src.CmsStore)   dst.CmsStore[kv.Key]   = kv.Value;
+    }
+
+    // -------------------------------------------------------------------------
+    // Routing
+    // -------------------------------------------------------------------------
 
     /// <summary>
     /// Routes the task to the correct worker. Handles cross-slot routing for multi-key commands like DEL.
@@ -174,6 +278,8 @@ public sealed class HyperionServer
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
+        _snapshot.StartPeriodicSave(() => SaveAllAsync().ContinueWith(_ => { }));
+
         _listener = new TcpListener(IPAddress.Any, _port);
         _listener.Start();
         _logger.LogInformation("Hyperion (multi-thread) listening on :{Port}", _port);
@@ -198,6 +304,9 @@ public sealed class HyperionServer
         }
         finally
         {
+            _snapshot.StopPeriodicSave();
+            // Final synchronous save before exit
+            SaveAllSync();
             _listener.Stop();
             _logger.LogInformation("Hyperion server stopped.");
         }

@@ -36,12 +36,20 @@ For the algorithm breakdown, Redis equivalence, and complexity analysis of each 
 | Sorted Set | `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZRANGE` |
 | Bloom Filter | `BF.RESERVE`, `BF.MADD`, `BF.EXISTS` |
 | Count-Min Sketch | `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY` |
+| Persistence | `SAVE`, `BGSAVE`, `LASTSAVE`, `DBSIZE` |
 
 **Server modes:**
 - **Single-threaded** — Follows Redis's original event-loop architecture. One dedicated OS thread owns all command execution. Async IO handlers feed commands through a lock-free `Channel`. Responses are batched with `PipeWriter` — one flush per read batch.
 - **Multi-threaded (share-nothing)** — Inspired by [DragonflyDB](https://www.dragonflydb.io/). N worker threads each own a private storage shard. IO Handlers route commands via FNV-1a hash. No mutexes, no spinlocks, no contention on the hot path.
 
 **Key expiry** — Both lazy (check on access) and active (background sweep sampling and deleting expired keys).
+
+**RDB Persistence** — Point-in-time binary snapshots compatible with both server modes:
+- Automatic saves via configurable policies (e.g. `save 300 100` — save after 5 min if ≥100 changes occurred)
+- Manual `SAVE` (synchronous, blocks until done) and `BGSAVE` (background, returns immediately)
+- Final save on graceful shutdown — data is never lost across restarts
+- Custom binary format with **CRC64** integrity check; all types (including Bloom Filter and Count-Min Sketch) are persisted
+- **Atomic write**: written to a `.tmp` file first, then renamed — an OS crash never corrupts the previous snapshot
 
 ---
 
@@ -174,17 +182,23 @@ Requirements: [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/1
 git clone https://github.com/ductai202/Hyperion.git
 cd Hyperion
 
-# Multi-threaded mode (default)
+# Multi-threaded mode (default) — data saved to ./dump.rdb
 dotnet run --project src/Hyperion.Server -c Release -- --port 3000
 
 # Single-threaded mode
 dotnet run --project src/Hyperion.Server -c Release -- --port 3000 --mode single
+
+# Custom RDB path
+dotnet run --project src/Hyperion.Server -c Release -- --port 3000 --dir /var/lib/hyperion --dbfilename hyperion.rdb
+
+# Disable persistence entirely
+dotnet run --project src/Hyperion.Server -c Release -- --port 3000 --no-save
 ```
 
 For maximum performance, publish as a self-contained binary:
 
 ```bash
-dotnet publish src/Hyperion.Server/Hyperion.Server.csproj \
+dotnet publish src/Hyperion.Server/Hyperion.Server.csproj \\
   -c Release -r linux-x64 --self-contained true -o ./publish
 
 ./publish/Hyperion.Server --port 3000 --mode multi
@@ -236,6 +250,5 @@ Full methodology, latency breakdown, pain points, and delay-workload analysis in
 ## What's Next
 
 - [ ] Redis Cluster protocol
-- [ ] RDB persistence
 - [ ] `ArrayPool<byte>` for response buffers to reduce GC pressure
 - [ ] Pre-cached static RESP responses (`+OK`, `:1`, `$-1`) to eliminate hot-path encoding

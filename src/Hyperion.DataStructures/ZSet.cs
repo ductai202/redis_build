@@ -118,4 +118,20 @@ public class ZSet
 
         return result;
     }
+
+    /// <summary>
+    /// Returns all member-score pairs for RDB serialization.
+    /// Iterates the skiplist in ascending order.
+    /// </summary>
+    public List<(string member, double score)> GetAllEntries()
+    {
+        var result = new List<(string, double)>(_dict.Count);
+        var node = _zskiplist.Head.Levels[0].Forward;
+        while (node != null)
+        {
+            result.Add((node.Ele, node.Score));
+            node = node.Levels[0].Forward;
+        }
+        return result;
+    }
 }

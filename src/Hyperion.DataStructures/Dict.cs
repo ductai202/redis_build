@@ -120,4 +120,13 @@ public class Dict
     {
         return _expiryStore;
     }
+
+    /// <summary>
+    /// Returns all key-object pairs in the store for RDB serialization.
+    /// Callers must filter expired keys themselves using GetExpireDictStore().
+    /// </summary>
+    public IEnumerable<KeyValuePair<string, DictObject>> GetAllEntries()
+    {
+        return _store;
+    }
 }

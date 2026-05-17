@@ -92,4 +92,10 @@ public class CMS
 
         return minCount;
     }
+
+    /// <summary>
+    /// Exposes the internal counter matrix for RDB serialization.
+    /// The caller reads/writes each cell directly for fast I/O.
+    /// </summary>
+    public uint[][] GetCounters() => _counter;
 }
