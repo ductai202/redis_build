@@ -63,6 +63,12 @@ Redis uses the same approach: `server.unixtime` is refreshed once per event-loop
 ### Why Plain Dictionary (Not ConcurrentDictionary)?
 Each `Worker` owns a **private** `Dict` instance. The routing layer (FNV-1a hash) guarantees that all accesses to a given key are dispatched to the same Worker thread — so no two threads ever access the same `Dict` concurrently. Using a plain `Dictionary` eliminates all lock overhead that `ConcurrentDictionary` would otherwise impose.
 
+### Trade-offs & Deep Dive: Why This Design?
+- **The Naive Approach (ConcurrentDictionary):** The standard way to build a multi-threaded cache in .NET is to use a `ConcurrentDictionary`. It handles thread safety under the hood using fine-grained locks (lock striping) and CAS (Compare-And-Swap) operations.
+- **The Drawbacks:** While easy to use, `ConcurrentDictionary` scales poorly under extreme concurrency (e.g., 100k+ RPS). Multiple threads fighting to update the same dictionary internal structures lead to "lock contention" and "CPU cache-line bouncing". The CPU spends more time synchronizing threads than actually executing commands.
+- **The Redis Idea:** Official Redis bypasses concurrency issues entirely by executing all commands on a single, event-driven thread. This guarantees zero lock contention but limits throughput to a single CPU core.
+- **Our Solution & Why It's Better:** We adopt a **"Share-Nothing" architecture** with a plain `Dictionary<string, DictObject>`. By hashing the key (using FNV-1a) at the network layer and routing it to a specific worker thread, we guarantee that each dictionary is only ever touched by one thread. This eliminates locks completely. We get the raw, lock-free speed of Redis's single-threaded model, but because we have multiple independent workers, that speed is multiplied across all available CPU cores. The trade-off is that memory isn't perfectly balanced across cores, but the massive gain in throughput makes it optimal.
+
 ### Redis Equivalence
 In Redis, the `redisDb` struct has two dictionaries:
 ```c
@@ -119,6 +125,12 @@ The pool maintains a fixed number of entries (`EVPOOL_SIZE = 16` in Redis). Our 
 
 ### Why Not Full LRU?
 A true LRU would require a doubly-linked list + hash map, adding 16+ bytes of overhead per key. Redis's author (Antirez) found that sampling just 5 keys per eviction cycle achieves **~95% accuracy** compared to perfect LRU, at zero per-key overhead.
+
+### Trade-offs & Deep Dive: Why This Design?
+- **The Naive Approach (Strict LRU):** The textbook algorithm for an LRU cache uses a Hash Map paired with a Doubly-Linked List. Whenever a key is accessed (`GET`), it is unlinked from its current position in the list and moved to the "head" (most recently used). When memory is full, the "tail" is evicted.
+- **The Drawbacks:** In a managed language like C#, every node requires at least two object references (`Next` and `Previous`). Moving a node to the head on *every single read operation* requires mutating multiple memory locations. This destroys CPU cache locality (pointer chasing) and generates massive cross-generation Garbage Collection (GC) pressure because older objects are constantly being modified to point to newer objects.
+- **The Redis Idea:** Redis avoids strict LRU to save memory (two pointers per key is expensive) and save CPU cycles. Instead, it randomly samples a few keys and evicts the oldest among the sample. It uses a small "Eviction Pool" to keep track of the best eviction candidates across samples.
+- **Our Solution & Why It's Better:** We implemented the Redis sampling algorithm. By using an `EvictionPool`, we eliminate the need for doubly-linked lists. Our `GET` hot-path simply updates a `long LastAccessTime` integer inside the object. This requires zero allocations and zero pointer shuffling. When memory is full, the O(N) sort is isolated to a tiny array (e.g., 16 items). We deliberately trade ~5% of LRU accuracy to eliminate object reference mutations on reads, which is absolutely critical in .NET to prevent GC pauses and maximize requests-per-second (RPS).
 
 ### Complexity
 | Operation | Time |
@@ -187,6 +199,12 @@ The mapping is exact:
 - `Backward` → `backward`
 - `Levels[i].Forward` → `level[i].forward`
 - `Levels[i].Span` → `level[i].span`
+
+### Trade-offs & Deep Dive: Why This Design?
+- **The Naive Approach (Balanced Trees):** When developers need a sorted collection with O(log N) operations, the standard choice is a Balanced Binary Search Tree, such as a Red-Black Tree or AVL Tree (e.g., C#'s `SortedSet<T>`).
+- **The Drawbacks:** Balanced trees enforce strict depth rules. When you insert or delete a node, the tree must often perform recursive "rotations" to rebalance itself. These rotations are complex to implement, involve updating multiple parent/child pointers, and cause significant CPU cache misses (pointer chasing across memory). Furthermore, adding support for O(log N) rank queries (e.g., "what is the index of this node?") to a Red-Black tree requires augmenting every node with subtree sizes, making rotations even more expensive.
+- **The Redis Idea:** Antirez chose Skip Lists over balanced trees for Redis because they rely on probability rather than strict rebalancing rules. They are much simpler, easier to augment, and use less memory per node on average.
+- **Our Solution & Why It's Better:** We implemented a Skip List from scratch. In a managed language like C#, avoiding complex tree rotations prevents unpredictable GC behavior. The Skip List acts like a simple linked list on the hot path. More importantly, its structure makes it incredibly easy to augment with a `Span` field (counting how many nodes a pointer skips). This allows us to support `ZRANK` (finding an element's position) in O(log N) time by simply summing the spans during traversal. This provides the exact same time complexity as a balanced tree, but with significantly lower constant factors and cache overhead.
 
 ### Complexity
 | Operation | Average | Worst |
@@ -258,6 +276,12 @@ typedef struct zset {
 } zset;
 ```
 Our `ZSet` is a 1:1 equivalent.
+
+### Trade-offs & Deep Dive: Why This Design?
+- **The Naive Approach (Single Structure):** To build a leaderboard, one might just use a sorted Array or a single Binary Tree. If you use a sorted array, finding a user by name requires an O(N) scan, and inserting a new score is O(N) because elements must shift. If you use a pure Tree, looking up a user's score by name takes O(log N) or O(N) if the tree is sorted by score (since you'd have to scan the tree to find the name). No single standard data structure provides both O(1) score lookup and O(log N) rank/range queries.
+- **The Drawbacks:** Using a single structure forces a massive compromise. Either you punish read latency (`ZSCORE` becomes slow) or you punish write latency (`ZADD` becomes slow).
+- **The Redis Idea:** Redis accepts a deliberate memory trade-off: it stores the data twice. It uses a dual-structure design, combining a Hash Table (for O(1) name-to-score lookups) and a Skip List (for O(log N) sorting and ranking), updating both synchronously.
+- **Our Solution & Why It's Better:** We embrace this dual-structure approach (`Dictionary` + `Skiplist`). We trade O(N) extra memory footprint to guarantee optimal time complexity for all operations. Furthermore, we ported a critical Redis optimization: **In-place Score Updates**. In leaderboards, users frequently gain a few points, changing their score but rarely changing their relative rank. Instead of doing an expensive O(log N) removal and re-insertion on every point change, our ZSet detects if the new score maintains the current ordering and simply updates the score field in O(1) time. This makes Hyperion exceptionally fast for real-time gaming leaderboards compared to standard sorted collections.
 
 ### Complexity
 | Operation | Time |
@@ -339,6 +363,12 @@ public HashValue CalcHash(string entry)
 ### Redis Equivalence
 Redis's Bloom Filter module (`RedisBloom`) uses the same optimal sizing formulas and the enhanced double hashing technique. Our implementation directly follows these algorithms.
 
+### Trade-offs & Deep Dive: Why This Design?
+- **The Naive Approach (HashSet):** The standard way to check if an element exists in a set (e.g., deduplication, checking if an IP is banned) is to store all elements in a `HashSet<string>`.
+- **The Drawbacks:** While a `HashSet` provides O(1) lookups and 100% accuracy, it must store the actual raw strings. If you have 100 million unique strings, this will consume gigabytes of RAM. In C#, this also fills the heap with millions of string objects, forcing the Garbage Collector to freeze the server for seconds at a time to scan the memory graph.
+- **The Redis Idea:** RedisBloom introduces a probabilistic bit-array (Bloom Filter). It trades 100% accuracy (accepting a known, tiny false positive rate, e.g., 1%) to achieve massive memory compression, storing zero actual strings. It also uses the Kirsch-Mitzenmacher optimization to generate `k` hashes without running `k` expensive hash algorithms.
+- **Our Solution & Why It's Better:** We implemented a highly optimized Bloom Filter. Instead of storing strings, checking existence requires only ~1.2 bytes per item. To make it performant in C#, we avoid calling cryptographic hash functions (like MD5 or SHA) repeatedly, which is extremely CPU-intensive. By using the double-hashing technique, we hash the string exactly *once* using `MD5.HashData`, split the 128-bit result into two 64-bit integers, and compute all `k` required hash positions using simple arithmetic (`A + B * i`). This gives us the mathematical guarantees of multiple independent hashes while burning a fraction of the CPU cycles and zero GC allocations.
+
 ### Complexity
 | Operation | Time |
 |---|---|
@@ -412,6 +442,12 @@ This is simpler than the Bloom Filter's double-hashing approach because each CMS
 
 ### Redis Equivalence
 Redis's CMS module (`RedisBloom/CMS`) uses the same width/depth formulas and the minimum-of-rows query strategy. The space-efficiency trade-off is identical.
+
+### Trade-offs & Deep Dive: Why This Design?
+- **The Naive Approach (Dictionary Frequency Map):** To track the frequency of events (e.g., "how many times has this video been viewed?"), the normal algorithm is to use a `Dictionary<string, int>`. Every time an item is seen, you find it in the dictionary and increment the integer.
+- **The Drawbacks:** If you are tracking billions of events across hundreds of millions of unique items (high cardinality), the dictionary will grow infinitely. It will consume unbounded memory and eventually crash the server with an `OutOfMemoryException`. Furthermore, as the dictionary grows, it must periodically resize its internal arrays, causing massive CPU latency spikes.
+- **The Redis Idea:** The Count-Min Sketch (CMS) trades perfect accuracy for sub-linear, fixed space. It hashes items into a fixed-size 2D array of counters. It deliberately allows slight over-counting (but never under-counting), keeping memory usage constant regardless of how many unique items are tracked.
+- **Our Solution & Why It's Better:** In a high-throughput .NET server, memory stability is crucial. By using CMS, we allocate a single, fixed-size 2D array (e.g., 56 KB) upfront upon creation. This guarantees an O(1) memory footprint. The server is completely immune to traffic spikes or infinite cardinality because it never allocates new memory for new items. The query strategy (taking the minimum across `d` rows) heavily mitigates hash collisions. For analytics like "Top 10 Heavy Hitters", CMS provides incredible speed and 100% memory safety at the cost of a statistically controlled error rate.
 
 ### Complexity
 | Operation | Time | Space |
